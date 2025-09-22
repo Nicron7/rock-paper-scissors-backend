@@ -27,28 +27,121 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private confirmedPlayers: Record<string, Set<string>> = {};
 
+  private clientRoomMap: Map<string, string> = new Map();
+
   handleConnection(client: Socket) {
     console.log('Client connected: ', client.id);
   }
 
   handleDisconnect(client: Socket) {
     console.log('Client disconnected: ', client.id);
-  }
 
+    const roomId = this.clientRoomMap.get(client.id);
+
+    if (roomId) {
+      if (this.confirmedPlayers[roomId]) {
+        this.confirmedPlayers[roomId].delete(client.id);
+
+        if (this.confirmedPlayers[roomId].size === 0) {
+          delete this.confirmedPlayers[roomId];
+        } else {
+          this.server.to(roomId).emit('playersConfirmed', {
+            confirmed: Array.from(this.confirmedPlayers[roomId]),
+          });
+        }
+      }
+      if (this.playAgainRequests[roomId]) {
+        this.playAgainRequests[roomId].delete(client.id);
+        if (this.playAgainRequests[roomId].size === 0) {
+          delete this.playAgainRequests[roomId];
+        }
+      }
+
+      if (this.rooms[roomId]?.moves) {
+        delete this.rooms[roomId].moves[client.id];
+      }
+
+      const players = Array.from(
+        this.server.sockets.adapter.rooms.get(roomId) || [],
+      );
+      this.server.to(roomId).emit('playersUpdate', { players });
+
+      this.clientRoomMap.delete(client.id);
+
+      console.log(`Cliente ${client.id} removido de la sala ${roomId}`);
+    }
+  }
   @SubscribeMessage('joinRoom')
   handleJoinRoom(client: Socket, roomId: string) {
+    const currentRoom = this.clientRoomMap.get(client.id);
+    if (currentRoom && currentRoom !== roomId) {
+      void client.leave(currentRoom);
+      this.handleLeaveRoom(client, currentRoom);
+    }
+
     void client.join(roomId);
+    this.clientRoomMap.set(client.id, roomId);
+
     const players = Array.from(
       this.server.sockets.adapter.rooms.get(roomId) || [],
     );
+
+    if (players.length > 2) {
+      void client.leave(roomId);
+      this.clientRoomMap.delete(client.id);
+      client.emit('roomFull', { message: 'La sala está llena' });
+      return;
+    }
+
+    if (!this.confirmedPlayers[roomId]) {
+      this.confirmedPlayers[roomId] = new Set();
+    }
+
     this.server.to(roomId).emit('playersUpdate', { players });
     this.server.to(roomId).emit('playerJoined', {
       playerId: client.id,
     });
-    console.log(`Sala ${roomId} ahora tiene jugadores:`, players);
 
-    if (!this.confirmedPlayers[roomId]) {
-      this.confirmedPlayers[roomId] = new Set();
+    this.server.to(roomId).emit('playersConfirmed', {
+      confirmed: Array.from(this.confirmedPlayers[roomId]),
+    });
+
+    console.log(`Sala ${roomId} ahora tiene jugadores:`, players);
+  }
+
+  @SubscribeMessage('leaveRoom')
+  handleLeaveRoom(client: Socket, roomId: string) {
+    void client.leave(roomId);
+
+    if (this.confirmedPlayers[roomId]) {
+      this.confirmedPlayers[roomId].delete(client.id);
+      if (this.confirmedPlayers[roomId].size === 0) {
+        delete this.confirmedPlayers[roomId];
+      }
+    }
+
+    if (this.playAgainRequests[roomId]) {
+      this.playAgainRequests[roomId].delete(client.id);
+      if (this.playAgainRequests[roomId].size === 0) {
+        delete this.playAgainRequests[roomId];
+      }
+    }
+
+    if (this.rooms[roomId]?.moves) {
+      delete this.rooms[roomId].moves[client.id];
+    }
+
+    this.clientRoomMap.delete(client.id);
+
+    const players = Array.from(
+      this.server.sockets.adapter.rooms.get(roomId) || [],
+    );
+    this.server.to(roomId).emit('playersUpdate', { players });
+
+    if (this.confirmedPlayers[roomId]) {
+      this.server.to(roomId).emit('playersConfirmed', {
+        confirmed: Array.from(this.confirmedPlayers[roomId]),
+      });
     }
   }
   @SubscribeMessage('confirmPlayer')
@@ -56,17 +149,39 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!this.confirmedPlayers[roomId]) {
       this.confirmedPlayers[roomId] = new Set();
     }
+    const roomPlayers = Array.from(
+      this.server.sockets.adapter.rooms.get(roomId) || [],
+    );
 
-    if (this.confirmedPlayers[roomId].size === 2) {
+    if (!roomPlayers.includes(client.id)) {
+      console.log(`Cliente ${client.id} no está en la sala ${roomId}`);
       return;
     }
+
+    if (this.confirmedPlayers[roomId].has(client.id)) {
+      console.log(`Cliente ${client.id} ya estaba confirmado`);
+      return;
+    }
+
+    if (this.confirmedPlayers[roomId].size >= 2) {
+      console.log(`Sala ${roomId} ya tiene 2 jugadores confirmados`);
+      return;
+    }
+
     this.confirmedPlayers[roomId].add(client.id);
 
     this.server.to(roomId).emit('playersConfirmed', {
       confirmed: Array.from(this.confirmedPlayers[roomId]),
     });
 
-    if (this.confirmedPlayers[roomId].size === 2) {
+    console.log(`Jugador ${client.id} confirmó en la sala ${roomId}`);
+    console.log(
+      `Confirmados en sala ${roomId}:`,
+      Array.from(this.confirmedPlayers[roomId]),
+    );
+
+    if (this.confirmedPlayers[roomId].size === 2 && roomPlayers.length === 2) {
+      console.log(`Iniciando juego en sala ${roomId}`);
       this.confirmedPlayers[roomId].clear();
       this.server.to(roomId).emit('gameStart', { countdown: 3 });
     }
@@ -182,8 +297,8 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       result = {
         players: [
-          { id: p1, move: m1 },
-          { id: p2, move: m2 },
+          { id: p1, userName: 'Jugador 1', move: m1 },
+          { id: p2, userName: 'Jugador 2', move: m2 },
         ],
         winner,
       };
