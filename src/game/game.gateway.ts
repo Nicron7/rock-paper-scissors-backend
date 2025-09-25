@@ -9,6 +9,10 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 
+interface PlayerHealth {
+  [playerId: string]: number;
+}
+
 @WebSocketGateway({
   cors: {
     origin: '*',
@@ -20,7 +24,12 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private rooms: Record<
     string,
-    { moves: Record<string, string>; timer?: NodeJS.Timeout }
+    {
+      moves: Record<string, string>;
+      timer?: NodeJS.Timeout;
+      playerHealth: PlayerHealth;
+      gameOver: boolean;
+    }
   > = {};
 
   private playAgainRequests: Record<string, Set<string>> = {};
@@ -61,6 +70,10 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
         delete this.rooms[roomId].moves[client.id];
       }
 
+      if (this.rooms[roomId]?.playerHealth) {
+        delete this.rooms[roomId].playerHealth[client.id];
+      }
+
       const players = Array.from(
         this.server.sockets.adapter.rooms.get(roomId) || [],
       );
@@ -71,6 +84,9 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       console.log(`Cliente ${client.id} removido de la sala ${roomId}`);
     }
   }
+
+  // Se maneja la entrada a la Room
+
   @SubscribeMessage('joinRoom')
   handleJoinRoom(client: Socket, roomId: string) {
     const currentRoom = this.clientRoomMap.get(client.id);
@@ -97,6 +113,18 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       this.confirmedPlayers[roomId] = new Set();
     }
 
+    if (!this.rooms[roomId]) {
+      this.rooms[roomId] = {
+        moves: {},
+        playerHealth: {},
+        gameOver: false,
+      };
+    }
+
+    if (!this.rooms[roomId].playerHealth[client.id]) {
+      this.rooms[roomId].playerHealth[client.id] = 100;
+    }
+
     this.server.to(roomId).emit('playersUpdate', { players });
     this.server.to(roomId).emit('playerJoined', {
       playerId: client.id,
@@ -105,9 +133,14 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server.to(roomId).emit('playersConfirmed', {
       confirmed: Array.from(this.confirmedPlayers[roomId]),
     });
+    this.server.to(roomId).emit('healthUpdate', {
+      playerHealth: this.rooms[roomId].playerHealth,
+    });
 
     console.log(`Sala ${roomId} ahora tiene jugadores:`, players);
   }
+
+  // Se maneja la salida de la room de los usuarios
 
   @SubscribeMessage('leaveRoom')
   handleLeaveRoom(client: Socket, roomId: string) {
@@ -130,6 +163,9 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (this.rooms[roomId]?.moves) {
       delete this.rooms[roomId].moves[client.id];
     }
+    if (this.rooms[roomId]?.playerHealth) {
+      delete this.rooms[roomId].playerHealth[client.id];
+    }
 
     this.clientRoomMap.delete(client.id);
 
@@ -144,6 +180,9 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       });
     }
   }
+
+  // Se confirman los jugadores para jugar
+
   @SubscribeMessage('confirmPlayer')
   handleConfirmPlayer(client: Socket, roomId: string) {
     if (!this.confirmedPlayers[roomId]) {
@@ -182,6 +221,14 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     if (this.confirmedPlayers[roomId].size === 2 && roomPlayers.length === 2) {
       console.log(`Iniciando juego en sala ${roomId}`);
+      for (const playerId of roomPlayers) {
+        this.rooms[roomId].playerHealth[playerId] = 100;
+      }
+      this.rooms[roomId].gameOver = false;
+
+      this.server.to(roomId).emit('healthUpdate', {
+        playerHealth: this.rooms[roomId].playerHealth,
+      });
       this.confirmedPlayers[roomId].clear();
       this.server.to(roomId).emit('gameStart', { countdown: 3 });
     }
@@ -189,12 +236,20 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('readyForRound')
   handleReadyForRound(client: Socket, data: { roomId: string }) {
+    if (this.rooms[data.roomId]?.gameOver) {
+      return;
+    }
     this.startRound(data.roomId);
   }
 
+  // Iniciar una nueva ronda
+
   startRound(roomId: string) {
     if (!this.rooms[roomId]) {
-      this.rooms[roomId] = { moves: {} };
+      this.rooms[roomId] = { moves: {}, playerHealth: {}, gameOver: false };
+    }
+    if (this.rooms[roomId].gameOver) {
+      return;
     }
     this.rooms[roomId].moves = {};
 
@@ -209,9 +264,14 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }, 10000);
   }
 
+  // Se maneja el movimiento de los jugadores
+
   @SubscribeMessage('playerMove')
   handlePlayerMove(client: Socket, payload: { roomId: string; move: string }) {
     const { roomId, move } = payload;
+    if (this.rooms[roomId]?.gameOver) {
+      return;
+    }
     this.rooms[roomId].moves[client.id] = move;
     const numPlayers = this.server.sockets.adapter.rooms.get(roomId)?.size || 0;
     if (Object.keys(this.rooms[roomId].moves).length === numPlayers) {
@@ -219,6 +279,8 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       this.finishRound(roomId);
     }
   }
+
+  // Este evento se encarga de emitir el "jugar de nuevo"
 
   @SubscribeMessage('playAgain')
   handlePlayAgain(
@@ -246,12 +308,23 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       setTimeout(() => {
         client.emit('playAgainConfirmed');
         this.playAgainRequests[roomId].clear();
+        for (const playerId of players) {
+          this.rooms[roomId].playerHealth[playerId] = 100;
+        }
+
+        this.server.to(roomId).emit('healthUpdate', {
+          playerHealth: this.rooms[roomId].playerHealth,
+        });
+
+        this.rooms[roomId].gameOver = false;
         this.server.to(roomId).emit('rematch', { countdown: 3 });
       }, 200);
     } else {
       client.emit('waitingForPlayers');
     }
   }
+
+  // Se maneja la fin de la ronda
 
   finishRound(roomId: string) {
     const moves = this.rooms[roomId].moves;
@@ -260,6 +333,8 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!room) {
       return;
     }
+
+    clearTimeout(this.rooms[roomId].timer);
 
     const players = Array.from(
       this.server.sockets.adapter.rooms.get(roomId) || [],
@@ -285,14 +360,18 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       if (m1 === m2) {
         winner = null;
+        room.playerHealth[p1] = Math.max(0, room.playerHealth[p1] - 5);
+        room.playerHealth[p2] = Math.max(0, room.playerHealth[p2] - 5);
       } else if (
         (m1 === 'piedra' && m2 === 'tijera') ||
         (m1 === 'papel' && m2 === 'piedra') ||
         (m1 === 'tijera' && m2 === 'papel')
       ) {
         winner = p1;
+        room.playerHealth[p2] = Math.max(0, room.playerHealth[p2] - 20);
       } else {
         winner = p2;
+        room.playerHealth[p1] = Math.max(0, room.playerHealth[p1] - 20);
       }
 
       result = {
@@ -301,11 +380,53 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
           { id: p2, userName: 'Jugador 2', move: m2 },
         ],
         winner,
+        healthDamage: winner === null ? 5 : 20,
       };
     }
 
     this.server.to(roomId).emit('roundEnd', result);
+
+    setTimeout(() => {
+      this.server.to(roomId).emit('healthUpdate', {
+        playerHealth: room.playerHealth,
+      });
+    }, 5000);
+
+    setTimeout(() => {
+      const gameWinner = this.checkGameOver(roomId);
+      if (gameWinner !== null) {
+        setTimeout(() => {
+          room.gameOver = true;
+          this.server.to(roomId).emit('gameOver', {
+            winner: gameWinner,
+            playerHealth: room.playerHealth,
+          });
+        }, 6800);
+      }
+    }, 100);
   }
+
+  // Checkea si la partida termino
+
+  private checkGameOver(roomId: string): string | null {
+    const room = this.rooms[roomId];
+    if (!room) return null;
+
+    const players = Object.keys(room.playerHealth);
+    const alivePlayers = players.filter(
+      (playerId) => room.playerHealth[playerId] > 0,
+    );
+
+    if (alivePlayers.length === 1) {
+      return alivePlayers[0];
+    } else if (alivePlayers.length === 0) {
+      return 'tie';
+    }
+
+    return null;
+  }
+
+  // Funcion para generar movimientos aleatorios
 
   private getRandomMove() {
     const moves = ['piedra', 'papel', 'tijera'];
